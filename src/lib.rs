@@ -1,5 +1,6 @@
 mod db;
 mod session;
+mod session_manager;
 mod timestamp;
 mod vfs;
 

@@ -7,10 +7,16 @@ use std::io::SeekFrom;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Session ID.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sid {
     pub timestamp: Timestamp,
     pub pid: Pid,
+}
+
+impl Sid {
+    pub fn new(pid: Pid, timestamp: Timestamp) -> Self {
+        Self { timestamp, pid }
+    }
 }
 
 impl Display for Sid {
@@ -87,7 +93,7 @@ impl<F: VirtualFile> SessionFile<F> {
             entry_len,
             checksum
         );
-        // flush serialized entry to the file
+        // write serialized entry to the session file
         self.file.write_all(&buf).await?;
         self.file.flush().await?;
 
@@ -179,7 +185,7 @@ mod test {
     use tokio::io::AsyncSeekExt;
 
     #[tokio::test]
-    async fn write_read_entries() {
+    async fn sequential_write_read() {
         let _ = env_logger::builder().is_test(true).try_init();
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut session = test_session(tmp_dir.path(), "test").await;
@@ -188,7 +194,7 @@ mod test {
         for i in 0..10 {
             let key = format!("key-{}", i);
             let value = format!("value-{}", i);
-            let entry = session
+            let _entry = session
                 .append_entry(key.as_bytes(), value.as_bytes())
                 .await
                 .unwrap();
@@ -203,7 +209,7 @@ mod test {
         for i in 0..10 {
             let expected_key = format!("key-{}", i);
             let expected_value = format!("value-{}", i);
-            let entry = session
+            let _entry = session
                 .next_entry(&mut key_buf, Some(&mut value_buf))
                 .await
                 .unwrap();
@@ -214,6 +220,42 @@ mod test {
 
             key_buf.clear();
             value_buf.clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn random_reads() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let mut session = test_session(tmp_dir.path(), "test").await;
+
+        // fill session file with new entries
+        let mut entries = Vec::new();
+        for i in 0..10 {
+            let key = format!("key-{}", i);
+            let value = format!("value-{}", i);
+            let entry = session
+                .append_entry(key.as_bytes(), value.as_bytes())
+                .await
+                .unwrap();
+            entries.push(entry);
+        }
+
+        // read every odd entry
+        for i in (1..10).step_by(2) {
+            let key = format!("key-{}", i);
+            let value = format!("value-{}", i);
+            let entry = &entries[i];
+            let mut key_buf = BytesMut::new();
+            let mut value_buf = BytesMut::new();
+            session
+                .read_entry(entry, &mut key_buf, &mut value_buf)
+                .await
+                .unwrap();
+            let actual_key = String::from_utf8(key_buf.to_vec()).unwrap();
+            let actual_value = String::from_utf8(value_buf.to_vec()).unwrap();
+            assert_eq!(key, actual_key);
+            assert_eq!(value, actual_value);
         }
     }
 

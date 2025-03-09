@@ -1,13 +1,21 @@
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures_lite::Stream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::fs::File;
 
 pub struct Dir {
     path: PathBuf,
+}
+
+impl Dir {
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
 }
 
 #[async_trait]
@@ -17,6 +25,12 @@ impl super::VirtualDir for Dir {
 
     async fn open_dir(dir_path: &str) -> std::io::Result<Self> {
         let dir_path = PathBuf::from(dir_path);
+        tokio::fs::create_dir_all(&dir_path).await?;
+        Ok(Dir { path: dir_path })
+    }
+
+    async fn open_subdir(&self, dir_name: &str) -> std::io::Result<Self> {
+        let dir_path = PathBuf::from(self.path.join(dir_name));
         tokio::fs::create_dir_all(&dir_path).await?;
         Ok(Dir { path: dir_path })
     }

@@ -1,31 +1,38 @@
-use crate::session::{SessionFile, Sid};
+use crate::session::Sid;
+use crate::session_manager::SessionManager;
 use crate::timestamp::Timestamp;
 use crate::vfs::VirtualDir;
 use bytes::{Bytes, BytesMut};
 use dashmap::{DashMap, Entry};
-use futures_lite::StreamExt;
 use std::cmp::Ordering;
-use std::str::FromStr;
 use std::sync::Arc;
-use tokio::pin;
+use tokio::sync::Mutex;
 
 pub type Pid = Arc<str>;
 
 pub struct Db<D: VirtualDir> {
-    entries: Arc<DashMap<Bytes, DbEntry>>,
-    root: D,
+    entries: DashMap<Bytes, DbEntry>,
+    sessions: Mutex<SessionManager<D>>,
     pid: Pid,
+    current_session: Sid,
 }
 
 impl<D: VirtualDir> Db<D> {
     pub async fn open_write<S: Into<Pid>>(pid: S, root: D) -> crate::Result<Self> {
         let pid = pid.into();
+        let sid = Sid::new(pid.clone(), Timestamp::now());
         let db = Db {
-            entries: DashMap::new().into(),
-            root,
             pid,
+            entries: DashMap::new(),
+            sessions: SessionManager::new(root).into(),
+            current_session: sid,
         };
         db.restore().await?;
+        {
+            // start a new session
+            let mut sessions = db.sessions.lock().await;
+            sessions.open(db.current_session.clone(), false).await?;
+        }
         Ok(db)
     }
 
@@ -34,54 +41,72 @@ impl<D: VirtualDir> Db<D> {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        todo!()
+        let key = key.as_ref();
+        let value = value.as_ref();
+        let entry = {
+            let mut lock = self.sessions.lock().await;
+            let session = lock.open(self.current_session.clone(), true).await?;
+            session.append_entry(key, value).await?
+        };
+        Self::merge(&self.entries, Bytes::copy_from_slice(key), entry);
+        Ok(())
     }
 
     pub async fn get<K>(&self, key: K) -> crate::Result<Option<Bytes>>
     where
         K: AsRef<[u8]>,
     {
-        todo!()
+        let key = key.as_ref();
+        match self.entries.get(key) {
+            Some(entry) => {
+                let entry = entry.value();
+
+                let mut lock = self.sessions.lock().await;
+                let session = lock.open(entry.sid().clone(), false).await?;
+                let mut key = BytesMut::new();
+                let mut value = BytesMut::new();
+                session.read_entry(entry, &mut key, &mut value).await?;
+                if value.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(value.freeze()))
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn remove<K>(&self, key: K) -> crate::Result<()>
     where
         K: AsRef<[u8]>,
     {
-        todo!()
+        // remove the entry is the same as inserting an empty value
+        self.insert(key, []).await
+    }
+
+    fn merge(x: &DashMap<Bytes, DbEntry>, key: Bytes, entry: DbEntry) -> Option<Sid> {
+        match x.entry(key) {
+            Entry::Occupied(mut e) => {
+                let existing = e.get();
+                if entry > *existing {
+                    // conflict resolution - keep the entry with the latest timestamp
+                    let old = e.insert(entry);
+                    Some(old.sid) // return the ID of the outdated entry
+                } else {
+                    Some(entry.sid) // return the ID of the new entry which is outdated
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(entry);
+                None
+            }
+        }
     }
 
     async fn restore(&self) -> crate::Result<()> {
-        let mut key = BytesMut::new();
-        let stream = self.root.list_files();
-        pin!(stream);
-        while let Some(res) = stream.next().await {
-            let pid = Pid::from(res?);
-            let subdir = D::open_dir(&pid).await?;
-            let files = subdir.list_files();
-            pin!(files);
-            while let Some(res) = files.next().await {
-                let file_name = res?;
-                let timestamp = Timestamp::from_str(&file_name)?;
-                let file = subdir.read_file(&file_name).await?;
-                let mut session = SessionFile::new(pid.clone(), timestamp, file).await?;
-                while let Ok(entry) = session.next_entry(&mut key, None).await {
-                    match self.entries.entry(key.clone().freeze()) {
-                        Entry::Occupied(mut e) => {
-                            let existing = e.get();
-                            if entry > *existing {
-                                // conflict resolution - keep the entry with the latest timestamp
-                                e.insert(entry);
-                            }
-                        }
-                        Entry::Vacant(e) => {
-                            e.insert(entry);
-                        }
-                    }
-                    key.clear(); // clear the key for the next iteration
-                }
-            }
-        }
+        let mut lock = self.sessions.lock().await;
+        lock.replay_all(|key, entry| Self::merge(&self.entries, key, entry))
+            .await?;
         Ok(())
     }
 }
@@ -199,6 +224,35 @@ impl Ord for DbEntry {
             Ordering::Less => Ordering::Less,
             Ordering::Greater => Ordering::Greater,
             Ordering::Equal => self.sid.pid.cmp(&other.sid.pid),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::db::Db;
+    use crate::vfs::fs::Dir;
+
+    #[tokio::test]
+    async fn insert_get() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = Dir::new(temp_dir.path());
+        let db = Db::open_write("test", root).await.unwrap();
+
+        // init database state
+        for i in 0..10 {
+            let key = format!("key-{}", i);
+            let value = format!("value-{}", i);
+            db.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+        }
+
+        // check if all entries are present
+        for i in 0..10 {
+            let key = format!("key-{}", i);
+            let value = format!("value-{}", i);
+            let result = db.get(key.as_bytes()).await.unwrap().unwrap();
+            assert_eq!(value.as_bytes(), &result[..]);
         }
     }
 }

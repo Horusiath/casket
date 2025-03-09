@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures_lite::Stream;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite};
 
-mod fs;
+pub mod fs;
 
 pub trait VirtualFile: AsyncRead + AsyncWrite + AsyncSeek + Unpin {}
 impl<F> VirtualFile for F where F: AsyncRead + AsyncWrite + AsyncSeek + Unpin {}
@@ -15,6 +15,10 @@ pub trait VirtualDir: Sized {
     /// Open or create a directory at the given path, recursively creating parent directories if
     /// necessary.
     async fn open_dir(dir_path: &str) -> std::io::Result<Self>;
+
+    /// Open or create a subdirectory at the given path, recursively creating parent directories if
+    /// necessary.
+    async fn open_subdir(&self, dir_name: &str) -> std::io::Result<Self>;
 
     /// Open a file with the given name at a current directory, for read-only mode. Returns an error
     /// if the file does not exist.
