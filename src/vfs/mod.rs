@@ -8,7 +8,7 @@ pub trait VirtualFile: AsyncRead + AsyncWrite + AsyncSeek + Unpin {}
 impl<F> VirtualFile for F where F: AsyncRead + AsyncWrite + AsyncSeek + Unpin {}
 
 #[async_trait]
-pub trait VirtualDir: Sized {
+pub trait VirtualDir: Sized + 'static {
     type File: VirtualFile;
     type Files: Stream<Item = crate::Result<String>>;
 

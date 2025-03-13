@@ -1,28 +1,27 @@
 use crate::session::{SessionFile, Sid};
 use crate::timestamp::Timestamp;
 use crate::vfs::{VirtualDir, VirtualFile};
-use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use dashmap::mapref::one::RefMut;
-use dashmap::{DashMap, Entry, OccupiedEntry};
+use dashmap::{DashMap, Entry};
 use futures_lite::StreamExt;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{Error, ErrorKind, SeekFrom};
+use std::collections::{BTreeMap, HashSet};
+use std::io::{ErrorKind, SeekFrom};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::pin;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::task::LocalSet;
 use tokio::time::MissedTickBehavior;
+
+const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Globally unique process identifier. String must be OS path compliant.
 pub type Pid = Arc<str>;
 
-#[derive(Clone)]
 pub struct Db<D: VirtualDir> {
     inner: Arc<DbInner<D>>,
 }
@@ -34,7 +33,7 @@ struct DbInner<D: VirtualDir> {
     /// file opening every time we need to get data from session files.
     sessions: DashMap<Sid, SessionHandle<D::File>>,
     /// Tracker used to check which session files have already been visited.
-    visited: DashMap<Pid, SessionTracker>,
+    visited: DashMap<Pid, BTreeMap<Timestamp, u64>>,
     /// Unique identifier of a current process.
     pid: Pid,
     /// Unique identifier of a currently opened session belonging to this process.
@@ -61,6 +60,11 @@ impl<D: VirtualDir> Db<D> {
 
         Ok(Self { inner })
     }
+
+    pub fn pid(&self) -> Pid {
+        self.inner.pid.clone()
+    }
+
     pub async fn insert<K, V>(&self, key: K, value: V) -> crate::Result<()>
     where
         K: AsRef<[u8]>,
@@ -82,6 +86,11 @@ impl<D: VirtualDir> Db<D> {
 
     pub async fn flush(&self) -> crate::Result<()> {
         self.inner.flush().await
+    }
+
+    pub async fn sync(&self) -> crate::Result<()> {
+        tracing::trace!("[{}] sync", self.pid());
+        self.inner.restore().await
     }
 }
 
@@ -166,37 +175,38 @@ where
             while let Some(res) = sessions.next().await {
                 let file_name = res?;
                 if file_name == ".head" {
-                    let timestamp = Self::read_head(&subdir).await?;
-                    let mut tracker = self.visited.entry(pid.clone()).or_default();
-                    tracker.active = Some(timestamp);
-                    tracing::trace!("active session for '{}': {}", pid, timestamp);
                     continue;
                 }
                 let timestamp = Timestamp::from_str(&file_name)?;
                 let sid = Sid::new(pid.clone(), timestamp);
-                self.restore_session(sid, 0).await?;
+                self.restore_session(sid).await?;
             }
         }
         Ok(())
     }
 
-    async fn restore_session(&self, sid: Sid, from: u64) -> crate::Result<()> {
+    async fn restore_session(&self, sid: Sid) -> crate::Result<()> {
+        let mut tracker = self.visited.entry(sid.pid.clone()).or_default();
+
+        let last_offset = tracker.entry(sid.timestamp).or_insert(0);
         tracing::trace!(
-            "restoring session {} starting from file position {}",
+            "[{}] restoring session {} from {}",
+            self.pid,
             sid,
-            from
+            last_offset
         );
         let mut h = self
             .sessions
             .session_entry(sid.clone())
             .or_read(&self.root)
             .await?;
-        h.session.seek(SeekFrom::Start(from)).await?;
+        h.session.seek(SeekFrom::Start(*last_offset)).await?;
         let mut key_buf = BytesMut::new();
         loop {
             key_buf.clear();
             match h.session.next_entry(&mut key_buf, None).await {
                 Ok(entry) => {
+                    tracing::trace!("[{}] read entry {:?} => {}", self.pid, key_buf, entry.id());
                     let key = key_buf.clone().freeze();
                     match self.entries.merge(key, entry) {
                         // current value is in use, increment the reference count for this session file
@@ -225,10 +235,13 @@ where
 
         // update tracker position
         let offset = h.session.seek(SeekFrom::Current(0)).await?;
-        tracing::trace!("restored session {} up to offset {}", sid, offset);
-        let mut tracker = self.visited.entry(sid.pid.clone()).or_default();
-        tracker.update(&sid, offset);
-
+        tracing::trace!(
+            "[{}] restored session {} up to offset {}",
+            self.pid,
+            sid,
+            offset
+        );
+        *last_offset = offset;
         drop(h); // DashMap's RefMut doesn't allow us to drop the value
         if let Entry::Occupied(mut e) = self.sessions.entry(sid) {
             // remote session from cache if it has no references
@@ -277,29 +290,6 @@ where
         let mut buf = [0u8; 8];
         f.read_exact(&mut buf).await?;
         Ok(Timestamp::from_le_bytes(buf))
-    }
-}
-
-/// Tracker of the session files.
-#[derive(Default)]
-struct SessionTracker {
-    /// Current active session.
-    active: Option<Timestamp>,
-    /// File offset within active session to which we have read the data.
-    active_offset: u64,
-    /// Already visited and closed sessions.
-    passive: HashSet<Timestamp>, //TODO: this could be bloom filter
-}
-
-impl SessionTracker {
-    fn update(&mut self, sid: &Sid, offset: u64) {
-        match &self.active {
-            Some(timestamp) if timestamp == &sid.timestamp => {
-                self.active_offset = offset;
-            }
-            _ => { /* do nothing */ }
-        }
-        self.passive.insert(sid.timestamp);
     }
 }
 
@@ -567,6 +557,10 @@ impl Merge for DashMap<Bytes, DbEntry> {
 mod test {
     use crate::db::Db;
     use crate::vfs::fs::Dir;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::task;
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn insert_get() {
@@ -619,6 +613,46 @@ mod test {
             let value = format!("value-{}", i);
             let result = db.get(key.as_bytes()).await.unwrap().unwrap();
             assert_eq!(value.as_bytes(), &result[..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_process() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = Dir::new(temp_dir.path());
+
+        const DB_COUNT: usize = 3;
+        const ENTRY_COUNT: usize = 10;
+        let mut dbs = Vec::with_capacity(DB_COUNT);
+        for i in 0..DB_COUNT {
+            let db = Db::open_write(format!("p{}", i), root.clone())
+                .await
+                .unwrap();
+            dbs.push(db);
+        }
+
+        for i in 0..ENTRY_COUNT {
+            let db = &dbs[i % dbs.len()];
+            let pid = db.pid();
+            let key = format!("key-{}", i);
+            let value = format!("value-{}-{}", i, pid);
+            db.insert(key, value).await.unwrap();
+            db.flush().await.unwrap();
+        }
+
+        for db in dbs.iter() {
+            db.sync().await.unwrap();
+        }
+
+        for i in 0..ENTRY_COUNT {
+            let key = format!("key-{}", i);
+            let origin = dbs[0].get(&key).await.unwrap().unwrap();
+            for j in 1..dbs.len() {
+                let db = &dbs[j];
+                let value = db.get(&key).await.unwrap().unwrap();
+                assert_eq!(origin, value);
+            }
         }
     }
 }

@@ -81,7 +81,8 @@ impl<F: VirtualFile> SessionFile<F> {
         );
 
         tracing::trace!(
-            "appending entry {} at position {} ({} bytes, checksum: {:x})",
+            "[{}] appending entry {} at position {} ({} bytes, checksum: {:x})",
+            self.sid.pid,
             entry.id(),
             file_position,
             entry_len,
@@ -136,15 +137,6 @@ impl<F: VirtualFile> SessionFile<F> {
             let value = &buf[(12 + key_len as usize)..(total_len - 4)];
             value_buf.extend_from_slice(value);
         }
-
-        tracing::trace!(
-            "read entry {}-{} at position {} ({} bytes, checksum: {:x})",
-            timestamp,
-            self.sid.pid,
-            start_len,
-            total_len,
-            checksum
-        );
 
         // we don't need value for now, go straight to checksum
         let checksum_bytes = u32::from_le_bytes(buf[(total_len - 4)..].try_into().unwrap());
