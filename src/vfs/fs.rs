@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::fs::File;
 
+#[derive(Debug, Clone)]
 pub struct Dir {
     path: PathBuf,
 }

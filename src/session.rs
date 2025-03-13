@@ -27,25 +27,19 @@ impl Display for Sid {
 
 pub struct SessionFile<F> {
     /// Session ID.
-    id: Sid,
+    sid: Sid,
     /// File handle.
     file: F,
 }
 
 impl<F: VirtualFile> SessionFile<F> {
-    pub async fn new(pid: Pid, start_time: Timestamp, mut file: F) -> crate::Result<Self> {
+    pub async fn new(sid: Sid, mut file: F) -> crate::Result<Self> {
         file.seek(SeekFrom::Start(0)).await?;
-        Ok(Self {
-            id: Sid {
-                timestamp: start_time,
-                pid,
-            },
-            file,
-        })
+        Ok(Self { sid, file })
     }
 
     pub fn sid(&self) -> &Sid {
-        &self.id
+        &self.sid
     }
 
     pub async fn append_entry(&mut self, key: &[u8], value: &[u8]) -> crate::Result<DbEntry> {
@@ -79,7 +73,7 @@ impl<F: VirtualFile> SessionFile<F> {
         buf.extend_from_slice(&checksum_bytes);
 
         let entry = DbEntry::new(
-            self.id.clone(),
+            self.sid.clone(),
             timestamp,
             file_position,
             key.len() as u32,
@@ -95,9 +89,17 @@ impl<F: VirtualFile> SessionFile<F> {
         );
         // write serialized entry to the session file
         self.file.write_all(&buf).await?;
-        self.file.flush().await?;
 
         Ok(entry)
+    }
+
+    pub async fn seek(&mut self, start_from: u64) -> crate::Result<()> {
+        self.file.seek(SeekFrom::Start(start_from)).await?;
+        Ok(())
+    }
+
+    pub async fn flush(&mut self) -> crate::Result<()> {
+        self.file.flush().await
     }
 
     pub async fn next_entry(
@@ -138,7 +140,7 @@ impl<F: VirtualFile> SessionFile<F> {
         tracing::trace!(
             "read entry {}-{} at position {} ({} bytes, checksum: {:x})",
             timestamp,
-            self.id.pid,
+            self.sid.pid,
             start_len,
             total_len,
             checksum
@@ -150,7 +152,7 @@ impl<F: VirtualFile> SessionFile<F> {
             Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum mismatch").into())
         } else {
             Ok(DbEntry::new(
-                self.id.clone(),
+                self.sid.clone(),
                 timestamp,
                 start_len,
                 key_len,
@@ -177,7 +179,7 @@ impl<F: VirtualFile> SessionFile<F> {
 #[cfg(test)]
 mod test {
     use crate::db::Pid;
-    use crate::session::SessionFile;
+    use crate::session::{SessionFile, Sid};
     use bytes::BytesMut;
     use std::io::SeekFrom;
     use std::path::Path;
@@ -273,6 +275,8 @@ mod test {
             .open(dir.join(pid.as_ref()).join(start_time.to_string()))
             .await
             .unwrap();
-        SessionFile::new(pid, start_time, file).await.unwrap()
+        SessionFile::new(Sid::new(pid, start_time), file)
+            .await
+            .unwrap()
     }
 }
