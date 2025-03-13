@@ -93,9 +93,9 @@ impl<F: VirtualFile> SessionFile<F> {
         Ok(entry)
     }
 
-    pub async fn seek(&mut self, start_from: u64) -> crate::Result<()> {
-        self.file.seek(SeekFrom::Start(start_from)).await?;
-        Ok(())
+    pub async fn seek(&mut self, seek_from: SeekFrom) -> crate::Result<u64> {
+        let offset = self.file.seek(seek_from).await?;
+        Ok(offset)
     }
 
     pub async fn flush(&mut self) -> crate::Result<()> {

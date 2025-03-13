@@ -7,24 +7,34 @@ use dashmap::mapref::one::RefMut;
 use dashmap::{DashMap, Entry, OccupiedEntry};
 use futures_lite::StreamExt;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Error, ErrorKind, SeekFrom};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::pin;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
+/// Globally unique process identifier. String must be OS path compliant.
 pub type Pid = Arc<str>;
 
+#[derive(Clone)]
 pub struct Db<D: VirtualDir> {
+    inner: Arc<DbInner<D>>,
+}
+
+struct DbInner<D: VirtualDir> {
     /// In BitCask architecture entries are stored in memory, while their values are persisted on disk.
     entries: DashMap<Bytes, DbEntry>,
     /// Structure which keeps file handles to opened active sessions. We do that to avoid expensive
     /// file opening every time we need to get data from session files.
     sessions: DashMap<Sid, SessionHandle<D::File>>,
+    /// Tracker used to check which session files have already been visited.
+    visited: DashMap<Pid, SessionTracker>,
     /// Unique identifier of a current process.
     pid: Pid,
     /// Unique identifier of a currently opened session belonging to this process.
@@ -37,27 +47,51 @@ impl<D: VirtualDir> Db<D> {
     pub async fn open_write<S: Into<Pid>>(pid: S, root: D) -> crate::Result<Self> {
         let pid = pid.into();
         let sid = Sid::new(pid.clone(), Timestamp::now());
-        let mut db = Db {
+        let mut inner = DbInner {
+            current_session: sid.clone(),
             pid,
             root,
-            current_session: sid.clone(),
             entries: DashMap::new(),
             sessions: DashMap::new(),
+            visited: DashMap::new(),
         };
-        db.restore().await?;
-        db.reset_session().await?;
-        Ok(db)
-    }
+        inner.restore().await?;
+        inner.reset_session().await?;
+        let inner = Arc::new(inner);
 
-    /// Insert a new key-value pair.
-    /// This operation doesn't flush the contents to the disk immediately. Use [flush] method to do so.
+        Ok(Self { inner })
+    }
     pub async fn insert<K, V>(&self, key: K, value: V) -> crate::Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let key = key.as_ref();
-        let value = value.as_ref();
+        self.inner.insert(key.as_ref(), value.as_ref()).await
+    }
+
+    pub async fn get<K: AsRef<[u8]>>(&self, key: K) -> crate::Result<Option<Bytes>> {
+        self.inner.get(key.as_ref()).await
+    }
+
+    pub async fn remove<K>(&self, key: K) -> crate::Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.inner.remove(key.as_ref()).await
+    }
+
+    pub async fn flush(&self) -> crate::Result<()> {
+        self.inner.flush().await
+    }
+}
+
+impl<D: VirtualDir> DbInner<D>
+where
+    D: VirtualDir,
+{
+    /// Insert a new key-value pair.
+    /// This operation doesn't flush the contents to the disk immediately. Use [flush] method to do so.
+    async fn insert(&self, key: &[u8], value: &[u8]) -> crate::Result<()> {
         let entry = {
             let mut h = self
                 .sessions
@@ -81,10 +115,7 @@ impl<D: VirtualDir> Db<D> {
 
     /// Reads the latest value for a given key-value pair. Returns None if key was not found or
     /// entry has been deleted.
-    pub async fn get<K>(&self, key: K) -> crate::Result<Option<Bytes>>
-    where
-        K: AsRef<[u8]>,
-    {
+    async fn get(&self, key: &[u8]) -> crate::Result<Option<Bytes>> {
         let key = key.as_ref();
         match self.entries.get(key) {
             Some(e) => {
@@ -107,19 +138,16 @@ impl<D: VirtualDir> Db<D> {
     }
 
     /// Remove a key-value entry for a given key.
-    pub async fn remove<K>(&self, key: K) -> crate::Result<()>
-    where
-        K: AsRef<[u8]>,
-    {
+    async fn remove(&self, key: &[u8]) -> crate::Result<()> {
         // remove the entry is the same as inserting an empty value
-        self.insert(key, []).await
+        self.insert(key, &[]).await
 
         //TODO: we could theoretically drop a session ref counter, but that doesn't mean that we
         // can prune the session file
     }
 
     /// Flushes all pending writes to the disk.
-    pub async fn flush(&self) -> crate::Result<()> {
+    async fn flush(&self) -> crate::Result<()> {
         if let Some(mut h) = self.sessions.get_mut(&self.current_session) {
             h.session.flush().await?;
         }
@@ -138,7 +166,11 @@ impl<D: VirtualDir> Db<D> {
             while let Some(res) = sessions.next().await {
                 let file_name = res?;
                 if file_name == ".head" {
-                    continue; //TODO: attach watcher over this pid
+                    let timestamp = Self::read_head(&subdir).await?;
+                    let mut tracker = self.visited.entry(pid.clone()).or_default();
+                    tracker.active = Some(timestamp);
+                    tracing::trace!("active session for '{}': {}", pid, timestamp);
+                    continue;
                 }
                 let timestamp = Timestamp::from_str(&file_name)?;
                 let sid = Sid::new(pid.clone(), timestamp);
@@ -159,7 +191,7 @@ impl<D: VirtualDir> Db<D> {
             .session_entry(sid.clone())
             .or_read(&self.root)
             .await?;
-        h.session.seek(from).await?;
+        h.session.seek(SeekFrom::Start(from)).await?;
         let mut key_buf = BytesMut::new();
         loop {
             key_buf.clear();
@@ -184,12 +216,20 @@ impl<D: VirtualDir> Db<D> {
                         }
                     }
                 }
-                Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                    break;
+                }
                 Err(err) => return Err(err.into()),
             }
         }
 
-        drop(h);
+        // update tracker position
+        let offset = h.session.seek(SeekFrom::Current(0)).await?;
+        tracing::trace!("restored session {} up to offset {}", sid, offset);
+        let mut tracker = self.visited.entry(sid.pid.clone()).or_default();
+        tracker.update(&sid, offset);
+
+        drop(h); // DashMap's RefMut doesn't allow us to drop the value
         if let Entry::Occupied(mut e) = self.sessions.entry(sid) {
             // remote session from cache if it has no references
             if e.get().ref_count <= 0 {
@@ -200,7 +240,7 @@ impl<D: VirtualDir> Db<D> {
     }
 
     /// Gracefully closes current write session for this process and opens a new one.
-    pub async fn reset_session(&mut self) -> crate::Result<()> {
+    async fn reset_session(&mut self) -> crate::Result<()> {
         if let Entry::Occupied(mut e) = self.sessions.entry(self.current_session.clone()) {
             tracing::trace!("closing current session {}", e.key());
             // we're going to reset this session, so flush all the data
@@ -230,6 +270,36 @@ impl<D: VirtualDir> Db<D> {
             e.insert(handle);
         }
         Ok(())
+    }
+
+    async fn read_head(subdir: &D) -> crate::Result<Timestamp> {
+        let mut f = subdir.read_file(".head").await?;
+        let mut buf = [0u8; 8];
+        f.read_exact(&mut buf).await?;
+        Ok(Timestamp::from_le_bytes(buf))
+    }
+}
+
+/// Tracker of the session files.
+#[derive(Default)]
+struct SessionTracker {
+    /// Current active session.
+    active: Option<Timestamp>,
+    /// File offset within active session to which we have read the data.
+    active_offset: u64,
+    /// Already visited and closed sessions.
+    passive: HashSet<Timestamp>, //TODO: this could be bloom filter
+}
+
+impl SessionTracker {
+    fn update(&mut self, sid: &Sid, offset: u64) {
+        match &self.active {
+            Some(timestamp) if timestamp == &sid.timestamp => {
+                self.active_offset = offset;
+            }
+            _ => { /* do nothing */ }
+        }
+        self.passive.insert(sid.timestamp);
     }
 }
 
@@ -543,7 +613,6 @@ mod test {
 
         // reopen the db
         let db = Db::open_write("test", root).await.unwrap();
-
         // check if all entries are present
         for i in 0..10 {
             let key = format!("key-{}", i);
