@@ -45,21 +45,21 @@ impl<F: VirtualFile> SessionFile<F> {
     pub async fn append_entry(&mut self, key: &[u8], value: &[u8]) -> crate::Result<DbEntry> {
         let file_position = self.file.seek(SeekFrom::End(0)).await?;
         let timestamp = Timestamp::now();
-        let entry_len = key.len() + value.len() + 16; // 8B timestamp + 4B key len + 4B checksum. Exclude total length, it was already read
-        let mut buf = Vec::with_capacity(entry_len - 4);
+        let entry_len = key.len() + value.len() + 20; // 4B total len + 8B timestamp + 4B key len + 4B checksum.
+        let mut buf = Vec::with_capacity(entry_len);
+        tracing::trace!(
+            "{} preparing write data (len: {}) at position: {}",
+            self.sid,
+            entry_len,
+            file_position
+        );
 
         // write total length of the entry
-        let entry_len_bytes = (entry_len as u32).to_le_bytes();
-        buf.extend_from_slice(&entry_len_bytes);
-
+        buf.extend_from_slice(&(entry_len as u32).to_le_bytes());
         // write timestamp
-        let timestamp_bytes = timestamp.to_le_bytes();
-        buf.extend_from_slice(&timestamp_bytes);
-
+        buf.extend_from_slice(&timestamp.to_le_bytes());
         // write key length
-        let key_len_bytes = (key.len() as u32).to_le_bytes();
-        buf.extend_from_slice(&key_len_bytes);
-
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
         // write key
         buf.extend_from_slice(key);
         // write value
@@ -81,11 +81,13 @@ impl<F: VirtualFile> SessionFile<F> {
         );
 
         tracing::trace!(
-            "[{}] appending entry {} at position {} ({} bytes, checksum: {:x})",
+            "[{}] session {} appending entry at {} - len: {}, ts: {}, key len: {}, checksum: {}",
             self.sid.pid,
-            entry.id(),
+            self.sid,
             file_position,
             entry_len,
+            entry.timestamp(),
+            key.len(),
             checksum
         );
         // write serialized entry to the session file
@@ -108,39 +110,46 @@ impl<F: VirtualFile> SessionFile<F> {
         key_buf: &mut BytesMut,
         value_buf: Option<&mut BytesMut>,
     ) -> crate::Result<DbEntry> {
-        let mut len_buf = [0u8; 4];
         let start_len = self.file.stream_position().await?;
-        self.file.read_exact(&mut len_buf).await?;
+        let mut header = [0u8; 16]; // 4B total len + 8B timestamp + 4B key len
+        self.file.read_exact(&mut header).await?;
 
         let mut crc = crc32fast::Hasher::new();
-        crc.update(&len_buf);
-        let total_len = u32::from_le_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; total_len];
-        self.file.read_exact(&mut buf).await?;
+        crc.update(&header);
 
-        // compute checksum
-        crc.update(&buf[..(total_len - 4)]); // exclude checksum itself
-        let checksum = crc.finalize();
-
+        // read total length
+        let total_len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
         // read timestamp
-        let timestamp = Timestamp::from_le_bytes(buf[..8].try_into().unwrap());
-
+        let timestamp = Timestamp::from_le_bytes(header[4..12].try_into().unwrap());
         // read key length
-        let key_len = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-
+        let key_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
         // read key
-        let key = &buf[12..(12 + key_len as usize)];
-        key_buf.extend_from_slice(key);
+        key_buf.clear();
+        key_buf.resize(key_len as usize, 0);
+        self.file.read_exact(&mut key_buf[..]).await?;
+        crc.update(&key_buf);
 
-        // read value if requested
-        if let Some(value_buf) = value_buf {
-            let value = &buf[(12 + key_len as usize)..(total_len - 4)];
-            value_buf.extend_from_slice(value);
-        }
+        // read value
+        let value_len = total_len - key_len as usize - 20;
+        let verify_crc = if let Some(value_buf) = value_buf {
+            value_buf.clear();
+            value_buf.resize(value_len, 0);
+            self.file.read_exact(&mut value_buf[..]).await?;
+            crc.update(&value_buf);
+            true
+        } else {
+            self.file.seek(SeekFrom::Current(value_len as i64)).await?; // move value_len forward
+            false
+        };
+
+        // read checksum
+        let mut checksum = [0u8; 4];
+        self.file.read_exact(&mut checksum).await?;
+        let checksum = u32::from_le_bytes(checksum);
 
         // we don't need value for now, go straight to checksum
-        let checksum_bytes = u32::from_le_bytes(buf[(total_len - 4)..].try_into().unwrap());
-        if checksum != checksum_bytes {
+        if verify_crc && checksum != crc.finalize() {
+            tracing::error!("{} cheksum for key {:?} don't match", self.sid, key_buf);
             Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum mismatch").into())
         } else {
             Ok(DbEntry::new(

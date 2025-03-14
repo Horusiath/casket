@@ -30,7 +30,7 @@ struct DbInner<D: VirtualDir> {
     /// file opening every time we need to get data from session files.
     sessions: DashMap<Sid, SessionHandle<D::File>>,
     /// Tracker used to check which session files have already been visited.
-    sync_progress: DashMap<Pid, ProgressTracker>,
+    sync_progress: DashMap<Pid, ProgressTracker<D::File>>,
     /// Unique identifier of a currently opened session belonging to this process.
     sid: Sid,
     /// Root entry to a file system, where current Database data is being stored.
@@ -101,19 +101,19 @@ where
     /// This operation doesn't flush the contents to the disk immediately. Use [flush] method to do so.
     async fn insert(&self, key: &[u8], value: &[u8]) -> crate::Result<()> {
         let entry = {
-            let mut h = self
-                .sessions
-                .session_entry(self.sid.clone())
-                .or_write(&self.root)
-                .await?;
+            let mut h = self.sessions.get_mut(&self.sid).unwrap();
             let e = h.session.append_entry(key, value).await?;
             h.inc_ref(); // increment number of entries using this session
             e
         };
-        let mut tracker = self
-            .sync_progress
-            .entry(self.sid.pid.clone())
-            .or_insert(ProgressTracker::new(self.sid.timestamp));
+        let mut tracker = match self.sync_progress.entry(self.sid.pid.clone()) {
+            Entry::Occupied(mut e) => e.into_ref(),
+            Entry::Vacant(mut e) => {
+                let log_list = LogListFile::open_write(e.key().clone(), &self.root).await?;
+                let tracker = ProgressTracker::new(log_list);
+                e.insert(tracker)
+            }
+        };
         tracker.current_offset += entry.total_len as u64;
         if let Some(sid) = self.entries.merge(Bytes::copy_from_slice(key), entry) {
             if let Entry::Occupied(mut session) = self.sessions.entry(sid) {
@@ -169,14 +169,20 @@ where
                 // with ourselves
                 continue;
             }
-            let subdir = self.root.open_subdir(&pid).await?;
-            let log_list = subdir.read_file(".loglist").await?;
-            let mut log_list = LogListFile::new(pid.clone(), log_list);
+            let mut tracker = match self.sync_progress.entry(pid.clone()) {
+                Entry::Occupied(mut e) => e.into_ref(),
+                Entry::Vacant(mut e) => {
+                    let log_list = LogListFile::open_read(e.key().clone(), &self.root).await?;
+                    let tracker = ProgressTracker::new(log_list);
+                    e.insert(tracker)
+                }
+            };
             loop {
-                match log_list.next_entry().await {
-                    Ok(e) => {
+                match tracker.log_list.next_entry().await {
+                    Ok(None) => break,
+                    Ok(Some(e)) => {
                         let sid = Sid::new(pid.clone(), e.session_start);
-                        self.restore_session(sid, e.size).await?;
+                        self.restore_session(sid, e.size, &mut tracker).await?;
                         if e.is_latest() {
                             break;
                         }
@@ -196,11 +202,12 @@ where
         Ok(())
     }
 
-    async fn restore_session(&self, sid: Sid, expected_size: Option<u64>) -> crate::Result<()> {
-        let mut tracker = self
-            .sync_progress
-            .entry(sid.pid.clone())
-            .or_insert(ProgressTracker::new(sid.timestamp));
+    async fn restore_session(
+        &self,
+        sid: Sid,
+        expected_size: Option<u64>,
+        tracker: &mut ProgressTracker<D::File>,
+    ) -> crate::Result<()> {
         tracing::trace!(
             "[{}] restoring session {} from {}",
             self.sid.pid,
@@ -484,8 +491,9 @@ where
             }),
             Entry::Vacant(mut e) => {
                 let sid = e.key();
-                let subdir = root.open_subdir(&sid.pid).await?;
-                let file = subdir.read_file(&sid.timestamp.to_string()).await?;
+                let file = root
+                    .read_file(&format!("{}/{}", sid.pid, sid.timestamp))
+                    .await?;
                 let session = SessionFile::new(sid.clone(), file).await?;
                 let handle = SessionHandle::new(session, 0);
 
@@ -506,8 +514,9 @@ where
             }),
             Entry::Vacant(e) => {
                 let sid = e.key();
-                let subdir = root.open_subdir(&sid.pid).await?;
-                let file = subdir.write_file(&sid.timestamp.to_string()).await?;
+                let file = root
+                    .write_file(&format!("{}/{}", sid.pid, sid.timestamp))
+                    .await?;
                 let session = SessionFile::new(sid.clone(), file).await?;
                 let handle = SessionHandle::new(session, 0);
 
@@ -537,15 +546,15 @@ impl<'a, F> DerefMut for SessionMut<'a, F> {
     }
 }
 
-struct ProgressTracker {
-    session: Timestamp,
+struct ProgressTracker<F> {
     current_offset: u64,
+    log_list: LogListFile<F>,
 }
 
-impl ProgressTracker {
-    fn new(session: Timestamp) -> Self {
+impl<F: VirtualFile> ProgressTracker<F> {
+    fn new(log_list: LogListFile<F>) -> Self {
         ProgressTracker {
-            session,
+            log_list,
             current_offset: 0,
         }
     }
@@ -665,11 +674,38 @@ mod test {
             dbs.push(db);
         }
 
+        tracing::info!("phase 1");
+
         for i in 0..ENTRY_COUNT {
             let db = &dbs[i % dbs.len()];
             let pid = db.pid();
             let key = format!("key-{}", i);
             let value = format!("value-{}-{}", i, pid);
+            db.insert(key, value).await.unwrap();
+            db.flush().await.unwrap();
+        }
+
+        for db in dbs.iter() {
+            db.sync().await.unwrap();
+        }
+
+        for i in 0..ENTRY_COUNT {
+            let key = format!("key-{}", i);
+            let origin = dbs[0].get(&key).await.unwrap().unwrap();
+            for j in 1..dbs.len() {
+                let db = &dbs[j];
+                let value = db.get(&key).await.unwrap().unwrap();
+                assert_eq!(origin, value);
+            }
+        }
+
+        tracing::info!("phase 2");
+
+        for i in 0..ENTRY_COUNT {
+            let db = &dbs[i % dbs.len()];
+            let pid = db.pid();
+            let key = format!("key-{}", i);
+            let value = format!("other-value-{}-{}", i, pid);
             db.insert(key, value).await.unwrap();
             db.flush().await.unwrap();
         }

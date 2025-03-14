@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::time::SystemTime;
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(u64);
 
 impl Timestamp {
