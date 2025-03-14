@@ -1,3 +1,4 @@
+use crate::loglist::LogListFile;
 use crate::session::{SessionFile, Sid};
 use crate::timestamp::Timestamp;
 use crate::vfs::{VirtualDir, VirtualFile};
@@ -6,16 +7,12 @@ use dashmap::mapref::one::RefMut;
 use dashmap::{DashMap, Entry};
 use futures_lite::StreamExt;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
 use std::io::{ErrorKind, SeekFrom};
 use std::ops::{Deref, DerefMut};
-use std::str::FromStr;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::pin;
-use tokio::task::LocalSet;
-use tokio::time::MissedTickBehavior;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -33,11 +30,9 @@ struct DbInner<D: VirtualDir> {
     /// file opening every time we need to get data from session files.
     sessions: DashMap<Sid, SessionHandle<D::File>>,
     /// Tracker used to check which session files have already been visited.
-    visited: DashMap<Pid, BTreeMap<Timestamp, u64>>,
-    /// Unique identifier of a current process.
-    pid: Pid,
+    sync_progress: DashMap<Pid, ProgressTracker>,
     /// Unique identifier of a currently opened session belonging to this process.
-    current_session: Sid,
+    sid: Sid,
     /// Root entry to a file system, where current Database data is being stored.
     root: D,
 }
@@ -46,15 +41,15 @@ impl<D: VirtualDir> Db<D> {
     pub async fn open_write<S: Into<Pid>>(pid: S, root: D) -> crate::Result<Self> {
         let pid = pid.into();
         let sid = Sid::new(pid.clone(), Timestamp::now());
+
         let mut inner = DbInner {
-            current_session: sid.clone(),
-            pid,
             root,
+            sid: sid.clone(),
             entries: DashMap::new(),
             sessions: DashMap::new(),
-            visited: DashMap::new(),
+            sync_progress: DashMap::new(),
         };
-        inner.restore().await?;
+        inner.restore(true).await?;
         inner.reset_session().await?;
         let inner = Arc::new(inner);
 
@@ -62,7 +57,7 @@ impl<D: VirtualDir> Db<D> {
     }
 
     pub fn pid(&self) -> Pid {
-        self.inner.pid.clone()
+        self.inner.sid.pid.clone()
     }
 
     pub async fn insert<K, V>(&self, key: K, value: V) -> crate::Result<()>
@@ -81,7 +76,11 @@ impl<D: VirtualDir> Db<D> {
     where
         K: AsRef<[u8]>,
     {
-        self.inner.remove(key.as_ref()).await
+        // remove the entry is the same as inserting an empty value
+        self.insert(key, &[]).await
+
+        //TODO: we could theoretically drop a session ref counter, but that doesn't mean that we
+        // can prune the session file
     }
 
     pub async fn flush(&self) -> crate::Result<()> {
@@ -90,7 +89,7 @@ impl<D: VirtualDir> Db<D> {
 
     pub async fn sync(&self) -> crate::Result<()> {
         tracing::trace!("[{}] sync", self.pid());
-        self.inner.restore().await
+        self.inner.restore(false).await
     }
 }
 
@@ -104,13 +103,18 @@ where
         let entry = {
             let mut h = self
                 .sessions
-                .session_entry(self.current_session.clone())
+                .session_entry(self.sid.clone())
                 .or_write(&self.root)
                 .await?;
             let e = h.session.append_entry(key, value).await?;
             h.inc_ref(); // increment number of entries using this session
             e
         };
+        let mut tracker = self
+            .sync_progress
+            .entry(self.sid.pid.clone())
+            .or_insert(ProgressTracker::new(self.sid.timestamp));
+        tracker.current_offset += entry.total_len as u64;
         if let Some(sid) = self.entries.merge(Bytes::copy_from_slice(key), entry) {
             if let Entry::Occupied(mut session) = self.sessions.entry(sid) {
                 if session.get_mut().dec_ref() {
@@ -146,67 +150,83 @@ where
         }
     }
 
-    /// Remove a key-value entry for a given key.
-    async fn remove(&self, key: &[u8]) -> crate::Result<()> {
-        // remove the entry is the same as inserting an empty value
-        self.insert(key, &[]).await
-
-        //TODO: we could theoretically drop a session ref counter, but that doesn't mean that we
-        // can prune the session file
-    }
-
     /// Flushes all pending writes to the disk.
     async fn flush(&self) -> crate::Result<()> {
-        if let Some(mut h) = self.sessions.get_mut(&self.current_session) {
+        if let Some(mut h) = self.sessions.get_mut(&self.sid) {
             h.session.flush().await?;
         }
         Ok(())
     }
 
     /// Iterate over all available sessions and restore their state into current database.
-    async fn restore(&self) -> crate::Result<()> {
+    async fn restore(&self, is_recovering: bool) -> crate::Result<()> {
         let subdirs = self.root.list_files();
         pin!(subdirs);
         while let Some(subdir) = subdirs.next().await {
             let pid = Pid::from(subdir?);
+            if !is_recovering && pid == self.sid.pid {
+                // if we're syncing, not recovering after shutdown, we're always up-to date
+                // with ourselves
+                continue;
+            }
             let subdir = self.root.open_subdir(&pid).await?;
-            let sessions = subdir.list_files();
-            pin!(sessions);
-            while let Some(res) = sessions.next().await {
-                let file_name = res?;
-                if file_name == ".head" {
-                    continue;
+            let log_list = subdir.read_file(".loglist").await?;
+            let mut log_list = LogListFile::new(pid.clone(), log_list);
+            loop {
+                match log_list.next_entry().await {
+                    Ok(e) => {
+                        let sid = Sid::new(pid.clone(), e.session_start);
+                        self.restore_session(sid, e.size).await?;
+                        if e.is_latest() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "[{}] error while reading log list for {}: {}",
+                            self.sid.pid,
+                            pid,
+                            err
+                        );
+                        break;
+                    }
                 }
-                let timestamp = Timestamp::from_str(&file_name)?;
-                let sid = Sid::new(pid.clone(), timestamp);
-                self.restore_session(sid).await?;
             }
         }
         Ok(())
     }
 
-    async fn restore_session(&self, sid: Sid) -> crate::Result<()> {
-        let mut tracker = self.visited.entry(sid.pid.clone()).or_default();
-
-        let last_offset = tracker.entry(sid.timestamp).or_insert(0);
+    async fn restore_session(&self, sid: Sid, expected_size: Option<u64>) -> crate::Result<()> {
+        let mut tracker = self
+            .sync_progress
+            .entry(sid.pid.clone())
+            .or_insert(ProgressTracker::new(sid.timestamp));
         tracing::trace!(
             "[{}] restoring session {} from {}",
-            self.pid,
+            self.sid.pid,
             sid,
-            last_offset
+            tracker.current_offset
         );
         let mut h = self
             .sessions
             .session_entry(sid.clone())
             .or_read(&self.root)
             .await?;
-        h.session.seek(SeekFrom::Start(*last_offset)).await?;
+        h.session
+            .seek(SeekFrom::Start(tracker.current_offset))
+            .await?;
         let mut key_buf = BytesMut::new();
         loop {
             key_buf.clear();
             match h.session.next_entry(&mut key_buf, None).await {
                 Ok(entry) => {
-                    tracing::trace!("[{}] read entry {:?} => {}", self.pid, key_buf, entry.id());
+                    tracker.current_offset += entry.total_len as u64;
+                    tracing::trace!(
+                        "[{}] read entry {:?} => {}",
+                        self.sid.pid,
+                        key_buf,
+                        entry.id()
+                    );
                     let key = key_buf.clone().freeze();
                     match self.entries.merge(key, entry) {
                         // current value is in use, increment the reference count for this session file
@@ -233,15 +253,22 @@ where
             }
         }
 
+        if let Some(expected_size) = expected_size {
+            if expected_size != tracker.current_offset {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "session file has different size than expected",
+                ));
+            }
+        }
+
         // update tracker position
-        let offset = h.session.seek(SeekFrom::Current(0)).await?;
         tracing::trace!(
             "[{}] restored session {} up to offset {}",
-            self.pid,
+            self.sid.pid,
             sid,
-            offset
+            tracker.current_offset
         );
-        *last_offset = offset;
         drop(h); // DashMap's RefMut doesn't allow us to drop the value
         if let Entry::Occupied(mut e) = self.sessions.entry(sid) {
             // remote session from cache if it has no references
@@ -254,7 +281,7 @@ where
 
     /// Gracefully closes current write session for this process and opens a new one.
     async fn reset_session(&mut self) -> crate::Result<()> {
-        if let Entry::Occupied(mut e) = self.sessions.entry(self.current_session.clone()) {
+        if let Entry::Occupied(mut e) = self.sessions.entry(self.sid.clone()) {
             tracing::trace!("closing current session {}", e.key());
             // we're going to reset this session, so flush all the data
             let h = e.get_mut();
@@ -265,31 +292,27 @@ where
             }
         }
 
-        self.current_session = Sid::new(self.pid.clone(), Timestamp::now());
-        let sid = self.current_session.clone();
-        tracing::trace!("initializing new session {}", sid);
+        let subdir = self.root.open_subdir(&self.sid.pid).await?;
+        let log_list = subdir.write_file(".loglist").await?;
+        let mut log_list = LogListFile::new(self.sid.pid.clone(), log_list);
+
+        if let Some(tracker) = self.sync_progress.get(&self.sid.pid) {
+            log_list.commit(tracker.current_offset).await?;
+        }
+
+        // start new session
+        let sid = log_list.begin().await?;
+        drop(log_list);
+
+        self.sid = sid.clone();
+        tracing::trace!("initializing new session {}", self.sid);
         if let Entry::Vacant(e) = self.sessions.entry(sid.clone()) {
             let subdir = self.root.open_subdir(&sid.pid).await?;
             let file = subdir.write_file(&sid.timestamp.to_string()).await?;
-
-            // keep track of current active session
-            let mut f = subdir.write_file(".head").await?;
-            // reset the file pointer to the beginning and override any existing content
-            f.seek(SeekFrom::Start(0)).await?;
-            f.write_all(sid.timestamp.to_string().as_bytes()).await?;
-
-            let session = SessionFile::new(sid, file).await?;
-            let handle = SessionHandle::new(session, 1);
-            e.insert(handle);
+            let session = SessionFile::new(self.sid.clone(), file).await?;
+            e.insert(SessionHandle::new(session, 1));
         }
         Ok(())
-    }
-
-    async fn read_head(subdir: &D) -> crate::Result<Timestamp> {
-        let mut f = subdir.read_file(".head").await?;
-        let mut buf = [0u8; 8];
-        f.read_exact(&mut buf).await?;
-        Ok(Timestamp::from_le_bytes(buf))
     }
 }
 
@@ -514,6 +537,20 @@ impl<'a, F> DerefMut for SessionMut<'a, F> {
     }
 }
 
+struct ProgressTracker {
+    session: Timestamp,
+    current_offset: u64,
+}
+
+impl ProgressTracker {
+    fn new(session: Timestamp) -> Self {
+        ProgressTracker {
+            session,
+            current_offset: 0,
+        }
+    }
+}
+
 trait SessionManager<F> {
     fn session_entry(&self, sid: Sid) -> SessionEntry<F>;
 }
@@ -557,10 +594,6 @@ impl Merge for DashMap<Bytes, DbEntry> {
 mod test {
     use crate::db::Db;
     use crate::vfs::fs::Dir;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::task;
-    use tokio::time::sleep;
 
     #[tokio::test]
     async fn insert_get() {

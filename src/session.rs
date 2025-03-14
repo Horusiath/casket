@@ -43,7 +43,7 @@ impl<F: VirtualFile> SessionFile<F> {
     }
 
     pub async fn append_entry(&mut self, key: &[u8], value: &[u8]) -> crate::Result<DbEntry> {
-        let file_position = self.file.stream_position().await?;
+        let file_position = self.file.seek(SeekFrom::End(0)).await?;
         let timestamp = Timestamp::now();
         let entry_len = key.len() + value.len() + 16; // 8B timestamp + 4B key len + 4B checksum. Exclude total length, it was already read
         let mut buf = Vec::with_capacity(entry_len - 4);
