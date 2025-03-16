@@ -38,6 +38,7 @@ struct DbInner<D: VirtualDir> {
 }
 
 impl<D: VirtualDir> Db<D> {
+    /// Open a database with a write capabilities.
     pub async fn open_write<S: Into<Pid>>(pid: S, root: D) -> crate::Result<Self> {
         let pid = pid.into();
         let sid = Sid::new(pid.clone(), Timestamp::now());
@@ -49,17 +50,19 @@ impl<D: VirtualDir> Db<D> {
             sessions: DashMap::new(),
             sync_progress: DashMap::new(),
         };
-        inner.restore(true).await?;
+        inner.sync(true).await?;
         inner.reset_session().await?;
         let inner = Arc::new(inner);
 
         Ok(Self { inner })
     }
 
+    /// Globally unique identifier of a current process.
     pub fn pid(&self) -> Pid {
         self.inner.sid.pid.clone()
     }
 
+    /// Inserts a key-value pair into current database.
     pub async fn insert<K, V>(&self, key: K, value: V) -> crate::Result<()>
     where
         K: AsRef<[u8]>,
@@ -68,10 +71,13 @@ impl<D: VirtualDir> Db<D> {
         self.inner.insert(key.as_ref(), value.as_ref()).await
     }
 
+    /// Reads value of an entry identified by a given key. Returns `Ok(None)` if key was not found
+    /// or has been deleted.
     pub async fn get<K: AsRef<[u8]>>(&self, key: K) -> crate::Result<Option<Bytes>> {
         self.inner.get(key.as_ref()).await
     }
 
+    /// Removes an entry identified by a given key.
     pub async fn remove<K>(&self, key: K) -> crate::Result<()>
     where
         K: AsRef<[u8]>,
@@ -83,13 +89,17 @@ impl<D: VirtualDir> Db<D> {
         // can prune the session file
     }
 
+    /// Flushes all pending write operations in a current session.
     pub async fn flush(&self) -> crate::Result<()> {
         self.inner.flush().await
     }
 
+    /// Pull the latest changes in an observed root directory this database lives in, synchronizing
+    /// with other processes that may potentially be concurrently making changes to a database.
+    /// Any conflicting entry writes are solved using conflict-free last-write-wins approach.
     pub async fn sync(&self) -> crate::Result<()> {
         tracing::trace!("[{}] sync", self.pid());
-        self.inner.restore(false).await
+        self.inner.sync(false).await
     }
 }
 
@@ -100,22 +110,18 @@ where
     /// Insert a new key-value pair.
     /// This operation doesn't flush the contents to the disk immediately. Use [flush] method to do so.
     async fn insert(&self, key: &[u8], value: &[u8]) -> crate::Result<()> {
+        // append key-value pair and construct an entry pointer
         let entry = {
             let mut h = self.sessions.get_mut(&self.sid).unwrap();
             let e = h.session.append_entry(key, value).await?;
             h.inc_ref(); // increment number of entries using this session
             e
         };
-        let mut tracker = match self.sync_progress.entry(self.sid.pid.clone()) {
-            Entry::Occupied(mut e) => e.into_ref(),
-            Entry::Vacant(mut e) => {
-                let log_list = LogListFile::open_write(e.key().clone(), &self.root).await?;
-                let tracker = ProgressTracker::new(log_list);
-                e.insert(tracker)
-            }
-        };
-        tracker.current_offset += entry.total_len as u64;
+
+        // merge entry pointer with existing database state
         if let Some(sid) = self.entries.merge(Bytes::copy_from_slice(key), entry) {
+            // if given key had any previous entry, decrement number of pointers for the session
+            // that entry was related to
             if let Entry::Occupied(mut session) = self.sessions.entry(sid) {
                 if session.get_mut().dec_ref() {
                     // remove session handle if there's no more entries pointing to it
@@ -132,6 +138,7 @@ where
         let key = key.as_ref();
         match self.entries.get(key) {
             Some(e) => {
+                // open a session for an entry we found and read it
                 let mut h = self
                     .sessions
                     .session_entry(e.sid.clone())
@@ -141,6 +148,7 @@ where
                 let mut value = BytesMut::new();
                 h.session.read_entry(&*e, &mut key, &mut value).await?;
                 if value.is_empty() {
+                    // see [Db::remove] - we treat no-value entries like tombstones
                     Ok(None)
                 } else {
                     Ok(Some(value.freeze()))
@@ -152,14 +160,22 @@ where
 
     /// Flushes all pending writes to the disk.
     async fn flush(&self) -> crate::Result<()> {
+        // get current session for this process and force flush its file - it's safe since one
+        // process always writes only to single session file at the time
         if let Some(mut h) = self.sessions.get_mut(&self.sid) {
             h.session.flush().await?;
         }
         Ok(())
     }
 
-    /// Iterate over all available sessions and restore their state into current database.
-    async fn restore(&self, is_recovering: bool) -> crate::Result<()> {
+    /// Iterate over all available process subdirectories and sync their contents with current
+    /// database process.
+    ///
+    /// `is_recovering` is `true` when we're recovering newly opened database: it means that this
+    /// process should also read its own process log to recover its own changes. When `false` we
+    /// only sync changes of other processes, since current process is always the most up-to date
+    /// with its own updates.
+    async fn sync(&self, is_recovering: bool) -> crate::Result<()> {
         let subdirs = self.root.list_files();
         pin!(subdirs);
         while let Some(subdir) = subdirs.next().await {
@@ -169,6 +185,7 @@ where
                 // with ourselves
                 continue;
             }
+            // check the last known sync progress for a given process
             let mut tracker = match self.sync_progress.entry(pid.clone()) {
                 Entry::Occupied(mut e) => e.into_ref(),
                 Entry::Vacant(mut e) => {
@@ -178,12 +195,16 @@ where
                 }
             };
             loop {
+                // try to continue synchronizing the process log files - since the last sync
+                // a log list file may have been updated and a new sessions may have appeared
                 match tracker.log_list.next_entry().await {
-                    Ok(None) => break,
+                    Ok(None) => break, // we reached the end of a log file
                     Ok(Some(e)) => {
                         let sid = Sid::new(pid.clone(), e.session_start);
-                        self.restore_session(sid, e.size, &mut tracker).await?;
+                        self.sync_session(sid, e.size, &mut tracker).await?;
                         if e.is_latest() {
+                            // the last entry of the log file is not committed, so we may need to
+                            // return to it in the next sync round
                             break;
                         }
                     }
@@ -202,32 +223,37 @@ where
         Ok(())
     }
 
-    async fn restore_session(
+    async fn sync_session(
         &self,
         sid: Sid,
         expected_size: Option<u64>,
         tracker: &mut ProgressTracker<D::File>,
     ) -> crate::Result<()> {
         tracing::trace!(
-            "[{}] restoring session {} from {}",
+            "[{}] syncing session {} from {}",
             self.sid.pid,
             sid,
             tracker.current_offset
         );
+        // get the session file we want to sync with
         let mut h = self
             .sessions
             .session_entry(sid.clone())
             .or_read(&self.root)
             .await?;
+
+        // put file cursor to the last position we ended reading on - session file might have been
+        // updated by another process, but it always works in append-only fashion
         h.session
             .seek(SeekFrom::Start(tracker.current_offset))
             .await?;
         let mut key_buf = BytesMut::new();
         loop {
-            key_buf.clear();
             match h.session.next_entry(&mut key_buf, None).await {
                 Ok(entry) => {
+                    // update the current session file cursor position
                     tracker.current_offset += entry.total_len as u64;
+                    //TODO: check if we didn't read beyond expected size
                     tracing::trace!(
                         "[{}] read entry {:?} => {}",
                         self.sid.pid,
@@ -235,6 +261,7 @@ where
                         entry.id()
                     );
                     let key = key_buf.clone().freeze();
+                    // try to merge the entry we read
                     match self.entries.merge(key, entry) {
                         // current value is in use, increment the reference count for this session file
                         None => h.inc_ref(),
@@ -254,12 +281,16 @@ where
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+                    // we reached the end of a session file
                     break;
                 }
                 Err(err) => return Err(err.into()),
             }
         }
 
+        // if the .loglist entry has a corresponding size provided it means that this session file
+        // was committed and should be no longer modified. We confirm that by checking if current
+        // length of file we read was equal to committed one.
         if let Some(expected_size) = expected_size {
             if expected_size != tracker.current_offset {
                 return Err(std::io::Error::new(
@@ -271,14 +302,15 @@ where
 
         // update tracker position
         tracing::trace!(
-            "[{}] restored session {} up to offset {}",
+            "[{}] synced session {} up to offset {}",
             self.sid.pid,
             sid,
             tracker.current_offset
         );
         drop(h); // DashMap's RefMut doesn't allow us to drop the value
+
         if let Entry::Occupied(mut e) = self.sessions.entry(sid) {
-            // remote session from cache if it has no references
+            // remove session from cache if it has no references
             if e.get().ref_count <= 0 {
                 e.remove();
             }
@@ -288,6 +320,7 @@ where
 
     /// Gracefully closes current write session for this process and opens a new one.
     async fn reset_session(&mut self) -> crate::Result<()> {
+        // first gracefully close any existing session
         if let Entry::Occupied(mut e) = self.sessions.entry(self.sid.clone()) {
             tracing::trace!("closing current session {}", e.key());
             // we're going to reset this session, so flush all the data
@@ -299,20 +332,23 @@ where
             }
         }
 
+        // commit session file length into a .loglist file - once this is done, session file cannot
+        // be changed
         let subdir = self.root.open_subdir(&self.sid.pid).await?;
         let log_list = subdir.write_file(".loglist").await?;
         let mut log_list = LogListFile::new(self.sid.pid.clone(), log_list);
-
         if let Some(tracker) = self.sync_progress.get(&self.sid.pid) {
             log_list.commit(tracker.current_offset).await?;
         }
 
-        // start new session
+        // start new session - a new timestamp will be generated and stored in .loglist file
         let sid = log_list.begin().await?;
         drop(log_list);
 
         self.sid = sid.clone();
         tracing::trace!("initializing new session {}", self.sid);
+
+        // create a session file for newly created timestamp
         if let Entry::Vacant(e) = self.sessions.entry(sid.clone()) {
             let subdir = self.root.open_subdir(&sid.pid).await?;
             let file = subdir.write_file(&sid.timestamp.to_string()).await?;
@@ -579,6 +615,9 @@ trait Merge {
 }
 
 impl Merge for DashMap<Bytes, DbEntry> {
+    /// Merge entry with a given key into current entry map. If that entry has overridden existing
+    /// one, returns a [Sid] of overridden entry. If input entry has loose the merge conflict
+    /// resolution, its own [Sid] will be returned.
     fn merge(&self, key: Bytes, entry: DbEntry) -> Option<Sid> {
         match self.entry(key) {
             Entry::Occupied(mut e) => {
