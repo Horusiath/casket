@@ -2,6 +2,9 @@ use std::fmt::Display;
 use std::str::FromStr;
 use std::time::SystemTime;
 
+/// Timestamp in milliseconds. It is used for entries conflict resolution.
+/// While this implementation uses system clock for simplicity, in practice
+/// you probably should something like Hybrid Logical Clock (HLC).
 #[repr(transparent)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(u64);
