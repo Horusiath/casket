@@ -4,7 +4,7 @@ use crate::timestamp::Timestamp;
 use crate::vfs::{VirtualDir, VirtualFile};
 use bytes::{Bytes, BytesMut};
 use dashmap::mapref::one::RefMut;
-use dashmap::{DashMap, Entry};
+use dashmap::{DashMap, Entry, OccupiedEntry};
 use futures_lite::StreamExt;
 use std::cmp::Ordering;
 use std::io::{ErrorKind, SeekFrom};
@@ -123,11 +123,8 @@ where
         if let Some(sid) = self.entries.merge(Bytes::copy_from_slice(key), entry) {
             // if given key had any previous entry, decrement number of pointers for the session
             // that entry was related to
-            if let Entry::Occupied(mut session) = self.sessions.entry(sid) {
-                if session.get_mut().dec_ref() {
-                    // remove session handle if there's no more entries pointing to it
-                    session.remove();
-                }
+            if let Entry::Occupied(session) = self.sessions.entry(sid) {
+                Self::try_gc(session);
             }
         }
         Ok(())
@@ -272,11 +269,8 @@ where
                         }
                         // after merge, this value has outdated another session, decrement that session's reference count
                         Some(sid) => {
-                            if let Entry::Occupied(mut other) = self.sessions.entry(sid) {
-                                if other.get_mut().dec_ref() {
-                                    // if number of references reaches zero, remove the session file handle
-                                    other.remove();
-                                }
+                            if let Entry::Occupied(other) = self.sessions.entry(sid) {
+                                Self::try_gc(other);
                             }
                         }
                     }
@@ -310,11 +304,9 @@ where
         );
         drop(h); // DashMap's RefMut doesn't allow us to drop the value
 
-        if let Entry::Occupied(mut e) = self.sessions.entry(sid) {
+        if let Entry::Occupied(e) = self.sessions.entry(sid) {
             // remove session from cache if it has no references
-            if e.get().ref_count <= 0 {
-                e.remove();
-            }
+            Self::try_gc(e);
         }
         Ok(())
     }
@@ -327,10 +319,7 @@ where
             // we're going to reset this session, so flush all the data
             let h = e.get_mut();
             h.session.flush().await?;
-            if h.dec_ref() {
-                // if there are no other references to this session, remove it from the cache
-                e.remove();
-            }
+            Self::try_gc(e);
         }
 
         // commit session file length into a .loglist file - once this is done, session file cannot
@@ -357,6 +346,14 @@ where
             e.insert(SessionHandle::new(session, 1));
         }
         Ok(())
+    }
+
+    /// Decrement number of references to this session and garbage collect it if no other
+    /// entry points to this session file.
+    fn try_gc(mut e: OccupiedEntry<Sid, SessionHandle<D::File>>) {
+        if e.get_mut().dec_ref() {
+            e.remove();
+        }
     }
 }
 
