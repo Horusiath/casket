@@ -26,8 +26,9 @@ pub struct Db<D: VirtualDir> {
 struct DbInner<D: VirtualDir> {
     /// In BitCask architecture entries are stored in memory, while their values are persisted on disk.
     entries: DashMap<Bytes, DbEntry>,
-    /// Structure which keeps file handles to opened active sessions. We do that to avoid expensive
-    /// file opening every time we need to get data from session files.
+    /// Structure which keeps file handles to opened active sessions. In some operating systems
+    /// opening a file is a costly operation, so we keep them open and track the numer of entries
+    /// referencing them.
     sessions: DashMap<Sid, SessionHandle<D::File>>,
     /// Tracker used to check which session files have already been visited.
     sync_progress: DashMap<Pid, ProgressTracker<D::File>>,

@@ -56,10 +56,10 @@ impl<F: VirtualFile> SessionFile<F> {
 
         // write total length of the entry
         buf.extend_from_slice(&(entry_len as u32).to_le_bytes());
-        // write timestamp
-        buf.extend_from_slice(&timestamp.to_le_bytes());
         // write key length
         buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        // write timestamp
+        buf.extend_from_slice(&timestamp.to_le_bytes());
         // write key
         buf.extend_from_slice(key);
         // write value
@@ -119,28 +119,30 @@ impl<F: VirtualFile> SessionFile<F> {
 
         // read total length
         let total_len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-        // read timestamp
-        let timestamp = Timestamp::from_le_bytes(header[4..12].try_into().unwrap());
         // read key length
-        let key_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        let key_len = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        // read timestamp
+        let timestamp = Timestamp::from_le_bytes(header[8..16].try_into().unwrap());
         // read key
         key_buf.clear();
         key_buf.resize(key_len as usize, 0);
         self.file.read_exact(&mut key_buf[..]).await?;
         crc.update(&key_buf);
 
-        // read value
         let value_len = total_len - key_len as usize - 20;
-        let verify_crc = if let Some(value_buf) = value_buf {
-            value_buf.clear();
-            value_buf.resize(value_len, 0);
-            self.file.read_exact(&mut value_buf[..]).await?;
-            crc.update(&value_buf);
-            true
-        } else {
-            self.file.seek(SeekFrom::Current(value_len as i64)).await?; // move value_len forward
-            false
-        };
+        let mut verify_crc = true;
+        if value_len > 0 {
+            if let Some(value_buf) = value_buf {
+                // read value
+                value_buf.clear();
+                value_buf.resize(value_len, 0);
+                self.file.read_exact(&mut value_buf[..]).await?;
+                crc.update(&value_buf);
+            } else {
+                verify_crc = false;
+                self.file.seek(SeekFrom::Current(value_len as i64)).await?; // move value_len forward
+            };
+        }
 
         // read checksum
         let mut checksum = [0u8; 4];
