@@ -4,17 +4,13 @@ use crate::timestamp::Timestamp;
 use crate::vfs::{VirtualDir, VirtualFile};
 use bytes::{Bytes, BytesMut};
 use dashmap::mapref::one::RefMut;
-use dashmap::{DashMap, Entry, OccupiedEntry};
+use dashmap::{DashMap, Entry};
 use futures_lite::StreamExt;
 use std::cmp::Ordering;
 use std::io::{ErrorKind, SeekFrom};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::pin;
-
-const REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Globally unique process identifier. String must be OS path compliant.
 pub type Pid = Arc<str>;
@@ -123,9 +119,7 @@ where
         if let Some(sid) = self.entries.merge(Bytes::copy_from_slice(key), entry) {
             // if given key had any previous entry, decrement number of pointers for the session
             // that entry was related to
-            if let Entry::Occupied(session) = self.sessions.entry(sid) {
-                Self::try_gc(session);
-            }
+            self.release_handle(&sid);
         }
         Ok(())
     }
@@ -185,8 +179,8 @@ where
             }
             // check the last known sync progress for a given process
             let mut tracker = match self.sync_progress.entry(pid.clone()) {
-                Entry::Occupied(mut e) => e.into_ref(),
-                Entry::Vacant(mut e) => {
+                Entry::Occupied(e) => e.into_ref(),
+                Entry::Vacant(e) => {
                     let log_list = LogListFile::open_read(e.key().clone(), &self.root).await?;
                     let tracker = ProgressTracker::new(log_list);
                     e.insert(tracker)
@@ -268,11 +262,7 @@ where
                             h.dec_ref();
                         }
                         // after merge, this value has outdated another session, decrement that session's reference count
-                        Some(sid) => {
-                            if let Entry::Occupied(other) = self.sessions.entry(sid) {
-                                Self::try_gc(other);
-                            }
-                        }
+                        Some(sid) => self.release_handle(&sid),
                     }
                 }
                 Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
@@ -302,11 +292,12 @@ where
             sid,
             tracker.current_offset
         );
-        drop(h); // DashMap's RefMut doesn't allow us to drop the value
-
-        if let Entry::Occupied(e) = self.sessions.entry(sid) {
-            // remove session from cache if it has no references
-            Self::try_gc(e);
+        drop(h);
+        // check if this session has any entries pointing to it and drop it if not
+        if let Entry::Occupied(mut e) = self.sessions.entry(sid) {
+            if e.get_mut().ref_count <= 0 {
+                e.remove();
+            }
         }
         Ok(())
     }
@@ -319,7 +310,9 @@ where
             // we're going to reset this session, so flush all the data
             let h = e.get_mut();
             h.session.flush().await?;
-            Self::try_gc(e);
+            if e.get_mut().dec_ref() {
+                e.remove();
+            }
         }
 
         // commit session file length into a .loglist file - once this is done, session file cannot
@@ -350,9 +343,11 @@ where
 
     /// Decrement number of references to this session and garbage collect it if no other
     /// entry points to this session file.
-    fn try_gc(mut e: OccupiedEntry<Sid, SessionHandle<D::File>>) {
-        if e.get_mut().dec_ref() {
-            e.remove();
+    fn release_handle(&self, sid: &Sid) {
+        if let Entry::Occupied(mut e) = self.sessions.entry(sid.clone()) {
+            if e.get_mut().dec_ref() {
+                e.remove();
+            }
         }
     }
 }
@@ -523,7 +518,7 @@ where
             Entry::Occupied(e) => Ok(SessionMut {
                 handle: e.into_ref(),
             }),
-            Entry::Vacant(mut e) => {
+            Entry::Vacant(e) => {
                 let sid = e.key();
                 let file = root
                     .read_file(&format!("{}/{}", sid.pid, sid.timestamp))
