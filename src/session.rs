@@ -131,18 +131,20 @@ impl<F: VirtualFile> SessionFile<F> {
 
         let value_len = total_len - key_len as usize - 20;
         let mut verify_crc = true;
-        if value_len > 0 {
-            if let Some(value_buf) = value_buf {
-                // read value
-                value_buf.clear();
-                value_buf.resize(value_len, 0);
+        if let Some(value_buf) = value_buf {
+            value_buf.clear();
+            value_buf.resize(value_len, 0);
+            if value_len > 0 {
                 self.file.read_exact(&mut value_buf[..]).await?;
                 crc.update(&value_buf);
-            } else {
-                verify_crc = false;
-                self.file.seek(SeekFrom::Current(value_len as i64)).await?; // move value_len forward
-            };
-        }
+            }
+        } else {
+            verify_crc = false;
+            // move value_len forward
+            if value_len > 0 {
+                self.file.seek(SeekFrom::Current(value_len as i64)).await?;
+            }
+        };
 
         // read checksum
         let mut checksum = [0u8; 4];
